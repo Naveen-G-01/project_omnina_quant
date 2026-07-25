@@ -201,9 +201,15 @@ def main():
                        for i in range(args.tau_steps)]
 
     # ---- 5. calibrate_fn / eval_fn closures for sweep_tau ---------------
+    # NOTE: use calib_loader (the same fixed 100-image stream used for the
+    # entropy pass), not train_loader. quantize_utils.calibrate() only pulls
+    # one batch via next(iter(loader)), so using train_loader here would (a)
+    # silently draw a different, shuffled set of images for the S_l/Z_l
+    # affine-quantization calibration than the ones used for H(X_l), and
+    # (b) make the 'calibration_images' figure in omnia_report.json inaccurate.
     def calibrate_fn(model, strategy):
         apply_strategy(model, quantizable_idx, strategy)
-        model = calibrate(model, train_loader)  # computes S_l, Z_l (quantize_utils)
+        model = calibrate(model, calib_loader)  # computes S_l, Z_l (quantize_utils)
         return model
 
     eval_max_batches = None
@@ -257,10 +263,10 @@ def main():
         'compression': compression,
         'hardware_estimate': hw_report,
         'targets_from_brief': {
-            'delta_top1_target': 0.8,
-            'delta_top1_met': final_acc_drop <= 0.8,
-            'low_bit_frac_target': 0.6,
-            'low_bit_frac_met': low_bit_frac >= 0.6,
+            'delta_top1_target': args.max_acc_drop,
+            'delta_top1_met': final_acc_drop <= args.max_acc_drop,
+            'low_bit_frac_target': args.min_low_bit_frac,
+            'low_bit_frac_met': low_bit_frac >= args.min_low_bit_frac,
             'compression_target_vs_int8': 2.2,
             'compression_met': compression['compression_vs_int8'] >= 2.2,
             'calibration_time_target_sec': 180,
@@ -279,9 +285,9 @@ def main():
     print('\n===== Project Omnia: Final Report =====')
     print(f"FP32 Top-1:        {fp32_acc:.3f}")
     print(f"Quantized Top-1:   {final_acc:.3f}  (drop: {final_acc_drop:.3f}, "
-          f"target <=0.8: {'PASS' if final_acc_drop <= 0.8 else 'FAIL'})")
-    print(f"INT4 layer frac:   {low_bit_frac:.3f}  (target >=0.60: "
-          f"{'PASS' if low_bit_frac >= 0.6 else 'FAIL'})")
+          f"target <={args.max_acc_drop}: {'PASS' if final_acc_drop <= args.max_acc_drop else 'FAIL'})")
+    print(f"INT4 layer frac:   {low_bit_frac:.3f}  (target >={args.min_low_bit_frac:.2f}: "
+          f"{'PASS' if low_bit_frac >= args.min_low_bit_frac else 'FAIL'})")
     print(f"Compression vs INT8: {compression['compression_vs_int8']:.2f}x "
           f"(target >=2.2x: {'PASS' if compression['compression_vs_int8'] >= 2.2 else 'FAIL'})")
     print(f"Calibration time:  {calib_time:.1f}s (target <=180s: "
