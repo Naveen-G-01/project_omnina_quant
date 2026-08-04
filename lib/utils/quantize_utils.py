@@ -1,6 +1,69 @@
 # Code for "[HAQ: Hardware-Aware Automated Quantization with Mixed Precision"
 # Kuan Wang*, Zhijian Liu*, Yujun Lin*, Ji Lin, Song Han
 # {kuanwang, zhijian, yujunlin, jilin, songhan}@mit.edu
+#
+# ---------------------------------------------------------------------------
+# Project Omnia addendum -- Weight/Activation Quantization Scheme
+# (experimental_checklist.md, Section 1: "Define the Weight Quantization
+#  Scheme")
+# ---------------------------------------------------------------------------
+# This is the explicit, documented decision for the quantization scheme used
+# throughout Project Omnia's entropy-driven mixed-precision pipeline
+# (entropy_quantize.py / lib/utils/entropy_utils.py). Both weights and
+# activations use uniform (linear) fake quantization with a *symmetric*
+# range -- i.e. zero-point is fixed at 0, and the quantized integer range is
+# [-(2^(b-1)-1), 2^(b-1)-1] -- rather than an asymmetric affine scheme with a
+# learned zero-point offset. Symmetric quantization was chosen because (a)
+# it matches the affine QConv2d/QLinear math already implemented here and
+# inherited unchanged from HAQ, (b) it is what standard INT4/INT8 edge
+# accelerator datapaths (the target hardware for this project) implement
+# natively, and (c) it avoids the extra per-layer zero-point add/subtract
+# that an asymmetric scheme would require in the "custom HLS datapath"
+# discussed in Section 4 of the checklist.
+#
+#   * Weights  : symmetric, PER-CHANNEL by default (one scale per output
+#                channel -- see `QModule.__init__`'s `per_channel` flag,
+#                and `QConv2d`/`QLinear` where the per-channel
+#                `weight_range` tensor is sized). Per-channel is the
+#                decided default because it is well known (Krishnamoorthi
+#                2018 and others) to noticeably reduce the accuracy loss
+#                of low-bit (INT4) weight quantization on depthwise/1x1
+#                mobile-style convolutions relative to a single per-tensor
+#                scale, at zero extra activation-side hardware cost (the
+#                per-channel scale is folded into the BatchNorm affine
+#                transform at deployment time, same as for any per-channel
+#                PTQ scheme). Pass `per_channel=False` to `QConv2d`/
+#                `QLinear` to fall back to HAQ's original per-tensor
+#                weight scheme -- this flag is intended for the
+#                per-channel-vs-per-tensor ablation called out in
+#                experimental_checklist.md Section 3.
+#   * Activations: symmetric, PER-TENSOR (a single scalar
+#                `activation_range` per layer, unchanged from HAQ).
+#                Per-channel activation quantization was *not* adopted:
+#                activations are quantized on the fly per input batch/
+#                image, so a per-channel scale would need to be computed
+#                (or stored) per-image rather than folded into a static
+#                weight tensor, which is far more expensive on the target
+#                edge datapaths and is not supported by the entropy-driven
+#                bit-assignment pipeline's single-pass calibration design.
+#   * Bias     : kept at 32-bit (unquantized in practice, see `_b_bit`),
+#                inherited unchanged from HAQ -- consistent with standard
+#                PTQ practice of accumulating in high precision.
+#   * Half-wave vs. full-wave activations: per layer, set by the existing
+#                `half_wave` constructor flag depending on what precedes
+#                that layer in the network graph -- half_wave=True (the
+#                default) for any conv/linear whose input just passed
+#                through a ReLU/ReLU6 (so it is already >= 0), and
+#                half_wave=False for layers whose input can be negative:
+#                the network's stem conv (raw, mean-subtracted image
+#                input) and any conv immediately after a residual add in a
+#                *linear* bottleneck (MobileNetV2/EfficientNet-Lite style
+#                inverted residuals -- see the `models/*.py` call sites).
+#                This is unchanged bookkeeping from HAQ; it is called out
+#                here only because it interacts with the symmetric-range
+#                decision above (half-wave ranges are quantized to
+#                [0, 2^b - 1], full-wave to [-(2^(b-1)-1), 2^(b-1)-1]).
+# ---------------------------------------------------------------------------
 
 import math
 import numpy as np
@@ -119,7 +182,7 @@ def kmeans_update_model(model, quantizable_idx, centroid_label_dict, free_high_b
 
 
 class QModule(nn.Module):
-    def __init__(self, w_bit=-1, a_bit=-1, half_wave=True):
+    def __init__(self, w_bit=-1, a_bit=-1, half_wave=True, per_channel=True):
         super(QModule, self).__init__()
 
         if half_wave:
@@ -129,9 +192,17 @@ class QModule(nn.Module):
         self._w_bit = w_bit
         self._b_bit = 32
         self._half_wave = half_wave
+        # see the "Weight/Activation Quantization Scheme" note at the top of
+        # this file: per_channel=True (the default) gives weights one scale
+        # per output channel; per_channel=False reproduces HAQ's original
+        # single-scale-per-tensor behavior.
+        self._per_channel = per_channel
 
         self.init_range = 6.
         self.activation_range = nn.Parameter(torch.Tensor([self.init_range]))
+        # Placeholder shape; QConv2d/QLinear re-create this parameter with
+        # the correct per-channel shape (out_channels/out_features, 1, ...)
+        # once they know their output size, when self._per_channel is True.
         self.weight_range = nn.Parameter(torch.Tensor([-1.0]), requires_grad=False)
 
         self._quantized = True
@@ -201,6 +272,18 @@ class QModule(nn.Module):
 
     def set_calibrate(self, calibrate=True):
         self._calibrate = calibrate
+
+    def _init_per_channel_weight_range(self, num_output_channels, ndim):
+        """
+        Re-creates `weight_range` as a per-output-channel vector shaped to
+        broadcast against a weight tensor with `ndim` dims whose dim-0 is
+        the output channel (out_channels for QConv2d, out_features for
+        QLinear). Called by QConv2d/QLinear.__init__ once out_channels /
+        out_features is known, only when self._per_channel is True -- see
+        the scheme note at the top of this file.
+        """
+        shape = (num_output_channels,) + (1,) * (ndim - 1)
+        self.weight_range = nn.Parameter(torch.full(shape, -1.0), requires_grad=False)
 
     def set_tanh(self, tanh=True):
         self._tanh_weight = tanh
@@ -279,29 +362,61 @@ class QModule(nn.Module):
         else:
             return inputs
 
+    def _per_channel_abs_max(self, weight):
+        """abs().max() reduced over every dim except dim 0 (output channel),
+        returned with the broadcastable shape self.weight_range already
+        has -- i.e. (out_channels, 1, 1, ...)."""
+        flat = weight.reshape(weight.size(0), -1)
+        return flat.abs().max(dim=1).values.view_as(self.weight_range)
+
     def _quantize_weight(self, weight):
         if self._tanh_weight:
             weight = weight.tanh()
             weight = weight / weight.abs().max()
 
         if self._quantized and self._w_bit > 0:
-            threshold = self.weight_range.item()
-            if threshold <= 0:
-                threshold = weight.abs().max().item()
-                self.weight_range.data[0] = threshold
+            if self._per_channel:
+                # one threshold (scale) per output channel -- see the
+                # scheme note at the top of this file
+                threshold = self.weight_range.clone()
+                if bool((threshold <= 0).all()):
+                    threshold = self._per_channel_abs_max(weight)
+                    self.weight_range.data.copy_(threshold)
+            else:
+                threshold = self.weight_range.item()
+                if threshold <= 0:
+                    threshold = weight.abs().max().item()
+                    self.weight_range.data[0] = threshold
 
             if self._calibrate:
-                if self._w_bit < 5:
-                    threshold = self._compute_threshold(weight.data.cpu().numpy(), self._w_bit)
+                if self._per_channel:
+                    if self._w_bit < 5:
+                        w_np = weight.data.cpu().numpy()
+                        per_channel_th = [self._compute_threshold(w_np[c], self._w_bit)
+                                          for c in range(w_np.shape[0])]
+                        threshold = torch.tensor(per_channel_th, device=weight.device,
+                                                 dtype=weight.dtype).view_as(self.weight_range)
+                    else:
+                        threshold = self._per_channel_abs_max(weight)
+                    self.weight_range.data.copy_(threshold)
                 else:
-                    threshold = weight.abs().max().item()
-                self.weight_range.data[0] = threshold
+                    if self._w_bit < 5:
+                        threshold = self._compute_threshold(weight.data.cpu().numpy(), self._w_bit)
+                    else:
+                        threshold = weight.abs().max().item()
+                    self.weight_range.data[0] = threshold
                 return weight
 
             ori_w = weight
 
             scaling_factor = threshold / (pow(2., self._w_bit - 1) - 1.)
-            w = ori_w.clamp(-threshold, threshold)
+            if self._per_channel:
+                # threshold/scaling_factor are (out_channels, 1, 1, ...)
+                # tensors here, so clamp via elementwise min/max (broadcast)
+                # rather than `.clamp()`, which expects python scalars
+                w = torch.max(torch.min(ori_w, threshold), -threshold)
+            else:
+                w = ori_w.clamp(-threshold, threshold)
             # w[w.abs() > threshold - threshold / 64.] = 0.
             w.div_(scaling_factor).round_().mul_(scaling_factor)
 
@@ -363,8 +478,9 @@ class STE(torch.autograd.Function):
 class QConv2d(QModule):
     def __init__(self, in_channels, out_channels, kernel_size, stride=1,
                  padding=0, dilation=1, groups=1, bias=False,
-                 w_bit=-1, a_bit=-1, half_wave=True):
-        super(QConv2d, self).__init__(w_bit=w_bit, a_bit=a_bit, half_wave=half_wave)
+                 w_bit=-1, a_bit=-1, half_wave=True, per_channel=True):
+        super(QConv2d, self).__init__(w_bit=w_bit, a_bit=a_bit, half_wave=half_wave,
+                                      per_channel=per_channel)
         if in_channels % groups != 0:
             raise ValueError('in_channels must be divisible by groups')
         if out_channels % groups != 0:
@@ -382,6 +498,9 @@ class QConv2d(QModule):
             self.bias = nn.Parameter(torch.zeros(out_channels))
         else:
             self.register_parameter('bias', None)
+        if self._per_channel:
+            # weight is (out_channels, in_channels/groups, kH, kW) -> 4 dims
+            self._init_per_channel_weight_range(out_channels, ndim=4)
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -409,12 +528,15 @@ class QConv2d(QModule):
         if self.w_bit > 0 or self.a_bit > 0:
             s += ', w_bit={}, a_bit={}'.format(self.w_bit, self.a_bit)
             s += ', half wave' if self.half_wave else ', full wave'
+            s += ', per-channel weights' if self._per_channel else ', per-tensor weights'
         return s.format(**self.__dict__)
 
 
 class QLinear(QModule):
-    def __init__(self, in_features, out_features, bias=True, w_bit=-1, a_bit=-1, half_wave=True):
-        super(QLinear, self).__init__(w_bit=w_bit, a_bit=a_bit, half_wave=half_wave)
+    def __init__(self, in_features, out_features, bias=True, w_bit=-1, a_bit=-1, half_wave=True,
+                 per_channel=True):
+        super(QLinear, self).__init__(w_bit=w_bit, a_bit=a_bit, half_wave=half_wave,
+                                      per_channel=per_channel)
         self.in_features = in_features
         self.out_features = out_features
         self.weight = nn.Parameter(torch.zeros(out_features, in_features))
@@ -422,6 +544,9 @@ class QLinear(QModule):
             self.bias = nn.Parameter(torch.zeros(out_features))
         else:
             self.register_parameter('bias', None)
+        if self._per_channel:
+            # weight is (out_features, in_features) -> 2 dims
+            self._init_per_channel_weight_range(out_features, ndim=2)
         self.reset_parameters()
 
     def forward(self, inputs):
@@ -441,6 +566,7 @@ class QLinear(QModule):
         if self.w_bit > 0 or self.a_bit > 0:
             s += ', w_bit={w_bit}, a_bit={a_bit}'.format(w_bit=self.w_bit, a_bit=self.a_bit)
             s += ', half wave' if self.half_wave else ', full wave'
+            s += ', per-channel weights' if self._per_channel else ', per-tensor weights'
         return s
 
 

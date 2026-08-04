@@ -14,6 +14,43 @@
 # finetune.py does for its linear-quantization path -- i.e. this file
 # only decides WHICH bit-width each layer gets; it does not reimplement
 # the actual affine quantization (scale S_l, zero-point Z_l) math.
+#
+# ---------------------------------------------------------------------
+# Histogram parameters (experimental_checklist.md Section 1: "Set
+# Histogram Parameters")
+# ---------------------------------------------------------------------
+#   * Bin count B: fixed at 256 (see `num_bins` below and
+#     entropy_quantize.py's `--num_bins`, default 256), matching the
+#     brief. 256 bins was kept as the default because it lines up 1:1
+#     with an INT8 activation range (2^8 = 256 representable levels), so
+#     the entropy histogram has the same resolution as the "high_bits"
+#     candidate quantizer it's being used to choose between -- a coarser
+#     bin count would under-resolve exactly the distinctions that matter
+#     for the INT8-vs-INT4 decision, and a much finer one mostly adds
+#     estimator variance on a ~100-image calibration stream without
+#     changing the resulting tau ranking.
+#   * Per-tensor vs. per-channel entropy: both are implemented here,
+#     selected via `entropy_mode=` ('per_tensor', the default, or
+#     'per_channel') on `ActivationEntropyCollector` /
+#     `run_calibration_and_get_entropy`, and via entropy_quantize.py's
+#     `--entropy_mode` flag. 'per_tensor' treats a layer's whole
+#     activation output as one distribution (one H(X_l) per layer,
+#     matching the brief's original formulation and the pipeline
+#     diagram's "Compute Shannon Entropy H(X_l)" stage). 'per_channel'
+#     instead builds one histogram per output channel, computes
+#     H(X_l,c) for each channel c, and reports the per-layer H(X_l) used
+#     for tau-thresholding as the mean over channels (the un-aggregated
+#     per-channel values are still available via
+#     `ActivationEntropyCollector.compute_per_channel_entropy()` for
+#     inspection/plotting -- e.g. the "qualitative figure of per-layer
+#     entropy vs. assigned bit-width" called for in Section 5). Per-tensor
+#     is the default because it's a single global-average-pool-free,
+#     one-histogram-per-layer computation that finishes well inside the
+#     <=180s calibration budget; per_channel is offered specifically so
+#     the choice can be *empirically* justified per Section 1 of the
+#     checklist by running both modes on the same calibration stream and
+#     diffing the resulting tau sweep / final accuracy in
+#     omnia_report.json, rather than asserted without evidence.
 
 import math
 from collections import OrderedDict
@@ -41,16 +78,29 @@ class ActivationEntropyCollector:
                 model(images.cuda() if use_cuda else images)
         collector.detach()
         entropy_dict = collector.compute_entropy()   # {layer_idx: H(X_l) in bits}
+
+    Pass entropy_mode='per_channel' to compute one histogram per output
+    channel instead of one per whole layer tensor; compute_entropy() still
+    returns one scalar per layer (mean over channels) so callers/tau-
+    sweeping don't need to change, but the un-aggregated values are
+    available via compute_per_channel_entropy(). See the "Histogram
+    parameters" note at the top of this file for why each mode exists.
     """
 
-    def __init__(self, model, quantizable_idx, num_bins=256, clip_percentile=99.9):
+    def __init__(self, model, quantizable_idx, num_bins=256, clip_percentile=99.9,
+                 entropy_mode='per_tensor'):
+        assert entropy_mode in ('per_tensor', 'per_channel'), \
+            "entropy_mode must be 'per_tensor' or 'per_channel', got %r" % (entropy_mode,)
         self.model = model
         self.quantizable_idx = set(quantizable_idx)
         self.num_bins = num_bins
         self.clip_percentile = clip_percentile
+        self.entropy_mode = entropy_mode
         self._hooks = []
         # per-layer running stats, built lazily on first batch since we
-        # need to see the activation range before we can bin it
+        # need to see the activation range before we can bin it. In
+        # per_tensor mode these are python floats; in per_channel mode
+        # they are 1-D tensors of length num_channels.
         self._running_min = {}
         self._running_max = {}
         self._histograms = {}
@@ -61,37 +111,75 @@ class ActivationEntropyCollector:
             if i in self.quantizable_idx:
                 yield i, m
 
+    @staticmethod
+    def _channel_dim(x):
+        # NCHW conv activations and NC linear activations both put the
+        # channel/feature axis at dim 1; fall back to dim 0 for anything
+        # unbatched/1-D (shouldn't normally occur for QConv2d/QLinear
+        # outputs, but keeps this from crashing on an odd module).
+        return 1 if x.dim() >= 2 else 0
+
     # ---- pass 1: find a robust min/max per layer (for stable binning) ----
     def _range_hook(self, layer_idx):
         def hook(module, inp, out):
             x = out.detach()
-            flat = x.reshape(-1)
-            if flat.numel() == 0:
-                return
-            lo = torch.quantile(flat.float(), 1 - self.clip_percentile / 100.0)
-            hi = torch.quantile(flat.float(), self.clip_percentile / 100.0)
-            lo, hi = lo.item(), hi.item()
-            if layer_idx not in self._running_min:
-                self._running_min[layer_idx] = lo
-                self._running_max[layer_idx] = hi
+            if self.entropy_mode == 'per_tensor':
+                flat = x.reshape(-1)
+                if flat.numel() == 0:
+                    return
+                lo = torch.quantile(flat.float(), 1 - self.clip_percentile / 100.0).item()
+                hi = torch.quantile(flat.float(), self.clip_percentile / 100.0).item()
+                if layer_idx not in self._running_min:
+                    self._running_min[layer_idx] = lo
+                    self._running_max[layer_idx] = hi
+                else:
+                    self._running_min[layer_idx] = min(self._running_min[layer_idx], lo)
+                    self._running_max[layer_idx] = max(self._running_max[layer_idx], hi)
             else:
-                self._running_min[layer_idx] = min(self._running_min[layer_idx], lo)
-                self._running_max[layer_idx] = max(self._running_max[layer_idx], hi)
+                cdim = self._channel_dim(x)
+                num_channels = x.size(cdim)
+                x_by_channel = x.transpose(0, cdim).reshape(num_channels, -1).float()
+                if x_by_channel.numel() == 0:
+                    return
+                lo = torch.quantile(x_by_channel, 1 - self.clip_percentile / 100.0, dim=1)
+                hi = torch.quantile(x_by_channel, self.clip_percentile / 100.0, dim=1)
+                if layer_idx not in self._running_min:
+                    self._running_min[layer_idx] = lo
+                    self._running_max[layer_idx] = hi
+                else:
+                    self._running_min[layer_idx] = torch.min(self._running_min[layer_idx], lo)
+                    self._running_max[layer_idx] = torch.max(self._running_max[layer_idx], hi)
         return hook
 
     # ---- pass 2: accumulate histogram counts using the fixed range ----
     def _hist_hook(self, layer_idx):
         def hook(module, inp, out):
-            x = out.detach().reshape(-1).float()
-            lo = self._running_min[layer_idx]
-            hi = self._running_max[layer_idx]
-            if hi <= lo:
-                hi = lo + 1e-6
-            hist = torch.histc(x, bins=self.num_bins, min=lo, max=hi)
-            if layer_idx not in self._histograms:
-                self._histograms[layer_idx] = hist
+            x = out.detach().float()
+            if self.entropy_mode == 'per_tensor':
+                flat = x.reshape(-1)
+                lo = self._running_min[layer_idx]
+                hi = self._running_max[layer_idx]
+                if hi <= lo:
+                    hi = lo + 1e-6
+                hist = torch.histc(flat, bins=self.num_bins, min=lo, max=hi)
+                if layer_idx not in self._histograms:
+                    self._histograms[layer_idx] = hist
+                else:
+                    self._histograms[layer_idx] += hist
             else:
-                self._histograms[layer_idx] += hist
+                cdim = self._channel_dim(x)
+                num_channels = x.size(cdim)
+                x_by_channel = x.transpose(0, cdim).reshape(num_channels, -1)
+                lo_vec = self._running_min[layer_idx]
+                hi_vec = self._running_max[layer_idx]
+                if layer_idx not in self._histograms:
+                    self._histograms[layer_idx] = torch.zeros(num_channels, self.num_bins)
+                for c in range(num_channels):
+                    lo, hi = lo_vec[c].item(), hi_vec[c].item()
+                    if hi <= lo:
+                        hi = lo + 1e-6
+                    self._histograms[layer_idx][c] += torch.histc(
+                        x_by_channel[c], bins=self.num_bins, min=lo, max=hi)
         return hook
 
     def attach_range_pass(self):
@@ -110,23 +198,52 @@ class ActivationEntropyCollector:
             h.remove()
         self._hooks = []
 
+    @staticmethod
+    def _entropy_from_hist(hist):
+        total = hist.sum().item()
+        if total <= 0:
+            return 0.0
+        p = hist / total
+        p = p[p > 0]  # ignore empty bins, 0*log(0) := 0
+        return -(p * torch.log2(p)).sum().item()
+
     def compute_entropy(self):
-        """Returns {layer_idx: Shannon entropy H(X_l) in bits}."""
+        """
+        Returns {layer_idx: Shannon entropy H(X_l) in bits}. In
+        'per_channel' mode this is the *mean* over per-channel entropies
+        (see compute_per_channel_entropy() for the un-aggregated values) so
+        that assign_bits_by_threshold()/sweep_tau() -- which compare one
+        scalar per layer against tau -- work unchanged regardless of mode.
+        """
         entropy = {}
         for idx, hist in self._histograms.items():
-            total = hist.sum().item()
-            if total <= 0:
-                entropy[idx] = 0.0
-                continue
-            p = hist / total
-            p = p[p > 0]  # ignore empty bins, 0*log(0) := 0
-            h = -(p * torch.log2(p)).sum().item()
-            entropy[idx] = h
+            if self.entropy_mode == 'per_tensor':
+                entropy[idx] = self._entropy_from_hist(hist)
+            else:
+                per_channel = [self._entropy_from_hist(hist[c]) for c in range(hist.size(0))]
+                entropy[idx] = float(sum(per_channel) / len(per_channel)) if per_channel else 0.0
         return entropy
+
+    def compute_per_channel_entropy(self):
+        """
+        Only meaningful when entropy_mode == 'per_channel'. Returns
+        {layer_idx: [H(X_l,c) for c in range(num_channels)]} -- the
+        un-aggregated per-channel entropies that compute_entropy() means
+        over. Useful for the "qualitative figure of per-layer entropy vs.
+        assigned bit-width" (checklist Section 5) at channel granularity,
+        or for spot-checking how much per-channel entropy varies within a
+        layer before deciding whether the per_channel mode's extra
+        histogram cost is worth it.
+        """
+        assert self.entropy_mode == 'per_channel', \
+            'compute_per_channel_entropy() requires entropy_mode="per_channel"'
+        return {idx: [self._entropy_from_hist(hist[c]) for c in range(hist.size(0))]
+                for idx, hist in self._histograms.items()}
 
 
 def run_calibration_and_get_entropy(model, calib_loader, quantizable_idx,
-                                     num_bins=256, use_cuda=True, max_batches=None):
+                                     num_bins=256, use_cuda=True, max_batches=None,
+                                     entropy_mode='per_tensor', return_collector=False):
     """
     Full two-pass calibration:
       pass 1 -> robust per-layer activation range (percentile clipped)
@@ -134,9 +251,15 @@ def run_calibration_and_get_entropy(model, calib_loader, quantizable_idx,
 
     This is the "[100 Sample Calibration Stream] -> [Layer-wise Activation
     Hook] -> [Compute Shannon Entropy H(X_l)]" stage of the pipeline.
+
+    entropy_mode: 'per_tensor' (default) or 'per_channel' -- see the
+    "Histogram parameters" note at the top of this file. Pass
+    return_collector=True to also get back the ActivationEntropyCollector
+    itself (e.g. to call compute_per_channel_entropy() afterwards).
     """
     model.eval()
-    collector = ActivationEntropyCollector(model, quantizable_idx, num_bins=num_bins)
+    collector = ActivationEntropyCollector(model, quantizable_idx, num_bins=num_bins,
+                                           entropy_mode=entropy_mode)
 
     with torch.no_grad():
         collector.attach_range_pass()
@@ -157,7 +280,10 @@ def run_calibration_and_get_entropy(model, calib_loader, quantizable_idx,
             model(images)
         collector.detach()
 
-    return collector.compute_entropy()
+    entropy_dict = collector.compute_entropy()
+    if return_collector:
+        return entropy_dict, collector
+    return entropy_dict
 
 
 # ---------------------------------------------------------------------
