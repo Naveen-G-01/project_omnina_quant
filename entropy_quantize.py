@@ -86,7 +86,15 @@ def get_args():
     p.add_argument('--resume', required=True, type=str,
                    help='path to FP32 pretrained checkpoint to quantize')
     # entropy / tau
-    p.add_argument('--num_bins', default=256, type=int)
+    p.add_argument('--num_bins', default=256, type=int,
+                   help='histogram bin count B for H(X_l) estimation (brief target: 256)')
+    p.add_argument('--entropy_mode', default='per_tensor', choices=['per_tensor', 'per_channel'],
+                   help='per_tensor (default): one activation histogram per layer. '
+                        'per_channel: one histogram per output channel, mean-aggregated '
+                        'to a per-layer H(X_l) for tau-thresholding. See the "Histogram '
+                        'parameters" note in lib/utils/entropy_utils.py for the tradeoffs; '
+                        'run both and diff omnia_report.json to empirically justify the '
+                        'choice per experimental_checklist.md Section 1.')
     p.add_argument('--tau_min', default=None, type=float,
                    help='if unset, derived from observed entropy range')
     p.add_argument('--tau_max', default=None, type=float)
@@ -189,10 +197,10 @@ def main():
     t0 = time.time()
     entropy_dict = run_calibration_and_get_entropy(
         model, calib_loader, quantizable_idx,
-        num_bins=args.num_bins, use_cuda=use_cuda)
+        num_bins=args.num_bins, use_cuda=use_cuda, entropy_mode=args.entropy_mode)
     calib_time = time.time() - t0
     print(f'[entropy_quantize] entropy calibration took {calib_time:.1f}s '
-          f'on {args.calib_size} images (target: <=180s)')
+          f'on {args.calib_size} images, entropy_mode={args.entropy_mode} (target: <=180s)')
 
     entropies = list(entropy_dict.values())
     tau_min = args.tau_min if args.tau_min is not None else min(entropies)
@@ -253,6 +261,8 @@ def main():
         'arch': args.arch,
         'calibration_images': args.calib_size,
         'calibration_time_sec': calib_time,
+        'histogram_num_bins': args.num_bins,
+        'entropy_mode': args.entropy_mode,
         'fp32_top1': fp32_acc,
         'final_top1': final_acc,
         'top1_drop': final_acc_drop,
