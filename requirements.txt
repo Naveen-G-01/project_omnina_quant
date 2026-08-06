@@ -1,0 +1,15 @@
+# Project Omnia -- runtime dependencies
+# Pinned loosely (>=) rather than exactly, since this is still a research
+# codebase, not a frozen release. Tighten these once results are final.
+
+torch>=2.0
+torchvision>=0.15
+numpy>=1.23
+scikit-learn>=1.2      # lib/utils/quantize_utils.py imports sklearn.cluster.KMeans
+                        # (used by the K-means/quantize_model path in the HAQ
+                        # code this was forked from; entropy_quantize.py itself
+                        # doesn't call it, but the import is at module load time,
+                        # so it must be installed either way)
+progress>=1.6           # Logger/Bar in lib/utils/utils.py, pretrain.py, rl_quantise.py
+tensorboardX>=2.6        # rl_quantise.py; pretrain.py falls back to this if
+                          # torch.utils.tensorboard isn't available
