@@ -34,10 +34,10 @@
 #     'per_channel') on `ActivationEntropyCollector` /
 #     `run_calibration_and_get_entropy`, and via entropy_quantize.py's
 #     `--entropy_mode` flag. 'per_tensor' treats a layer's whole
-#     activation output as one distribution (one H(X_l) per layer,
+#     activation input as one distribution (one H(X_l) per layer,
 #     matching the brief's original formulation and the pipeline
 #     diagram's "Compute Shannon Entropy H(X_l)" stage). 'per_channel'
-#     instead builds one histogram per output channel, computes
+#     instead builds one histogram per input channel, computes
 #     H(X_l,c) for each channel c, and reports the per-layer H(X_l) used
 #     for tau-thresholding as the mean over channels (the un-aggregated
 #     per-channel values are still available via
@@ -51,12 +51,72 @@
 #     checklist by running both modes on the same calibration stream and
 #     diffing the resulting tau sweep / final accuracy in
 #     omnia_report.json, rather than asserted without evidence.
+#
+# ---------------------------------------------------------------------
+# Bug fixes applied after code review (both in the capture path below)
+# ---------------------------------------------------------------------
+#   1. H(X_l) now measures each layer's INPUT, not its output. `a_bit`
+#      (see quantize_utils.py's QModule._quantize_activation) quantizes
+#      the tensor a QConv2d/QLinear *receives*, so that's the tensor its
+#      entropy should describe -- not the layer's own raw, pre-
+#      BatchNorm/pre-activation output, which is what the hooks read
+#      before this fix (`out` instead of `inp[0]`). This changes what
+#      "per_channel" means: it's now per *input* channel (updated in the
+#      docstrings/CLI help below), which is also why the entropy of the
+#      network's very first quantizable layer is measured against the
+#      raw normalized image rather than that layer's own convolution
+#      output.
+#   2. `torch.quantile()` has a hard limit of 16,777,216 elements
+#      (RuntimeError: "quantile() input tensor is too large" --
+#      pytorch/pytorch#64947, still true in current PyTorch). The
+#      per_tensor range pass used to call it on a layer's *entire*
+#      flattened activation, which realistic vision-model layers blow
+#      past easily (e.g. qmobilenetv2's stage-2 expand conv is
+#      ~30M elements at the default --calib_batch=25; qresnet18/50's
+#      stem alone is ~20M) -- this crashed calibration on batch 1 for
+#      every architecture in this repo under the README's own example
+#      commands. `_safe_quantile_1d`/`_safe_quantile_rows` below
+#      subsample before calling torch.quantile whenever the input is
+#      larger than it can handle; a few million samples gives a
+#      percentile estimate with negligible variance for calibration
+#      purposes, so this costs nothing anyone would notice.
 
 import math
 from collections import OrderedDict
 
 import torch
 import torch.nn as nn
+
+
+# torch.quantile() raises "RuntimeError: quantile() input tensor is too
+# large" above this many elements (pytorch/pytorch#64947). Kept well under
+# the actual 16,777,216 cutoff for margin.
+_QUANTILE_MAX_ELEMENTS = 4_000_000
+
+
+def _safe_quantile_1d(x, q, max_elements=_QUANTILE_MAX_ELEMENTS):
+    """torch.quantile on a flat 1-D tensor, uniformly subsampling first if
+    x is larger than torch.quantile can handle. See the "Bug fixes
+    applied" note at the top of this file."""
+    n = x.numel()
+    if n > max_elements:
+        idx = torch.randint(0, n, (max_elements,), device=x.device)
+        x = x[idx]
+    return torch.quantile(x, q)
+
+
+def _safe_quantile_rows(x, q, max_elements=_QUANTILE_MAX_ELEMENTS):
+    """torch.quantile(..., dim=1) on a 2-D (rows, values) tensor,
+    subsampling each row independently if any row is larger than
+    torch.quantile can handle. Used by the per_channel branch below; in
+    practice a row here is one channel's batch*H*W values, which rarely
+    hits the limit on its own, but this keeps it safe for large batch
+    sizes / high input resolutions too."""
+    n_per_row = x.size(1)
+    if n_per_row > max_elements:
+        idx = torch.randint(0, n_per_row, (max_elements,), device=x.device)
+        x = x[:, idx]
+    return torch.quantile(x, q, dim=1)
 
 
 # ---------------------------------------------------------------------
@@ -68,7 +128,11 @@ class ActivationEntropyCollector:
     Registers forward hooks on every quantizable layer (QConv2d / QLinear,
     or nn.Conv2d / nn.Linear if you are profiling the FP32 model before
     swapping in quantized layers) and accumulates a running histogram of
-    each layer's output activations across the calibration stream.
+    each layer's INPUT activations -- i.e. `inp[0]` in the hook, the exact
+    tensor `_quantize_activation()` in quantize_utils.py fake-quantizes at
+    inference time -- across the calibration stream. (Hooking the input,
+    not the output, is a bug fix from code review: the two can have very
+    different distributions once BatchNorm/ReLU sit between them.)
 
     Usage:
         collector = ActivationEntropyCollector(model, quantizable_idx, num_bins=256)
@@ -79,7 +143,7 @@ class ActivationEntropyCollector:
         collector.detach()
         entropy_dict = collector.compute_entropy()   # {layer_idx: H(X_l) in bits}
 
-    Pass entropy_mode='per_channel' to compute one histogram per output
+    Pass entropy_mode='per_channel' to compute one histogram per input
     channel instead of one per whole layer tensor; compute_entropy() still
     returns one scalar per layer (mean over channels) so callers/tau-
     sweeping don't need to change, but the un-aggregated values are
@@ -122,13 +186,20 @@ class ActivationEntropyCollector:
     # ---- pass 1: find a robust min/max per layer (for stable binning) ----
     def _range_hook(self, layer_idx):
         def hook(module, inp, out):
-            x = out.detach()
+            # Bug fix: a_bit quantizes a layer's *input* (see
+            # QConv2d.forward / QModule._quantize_activation in
+            # quantize_utils.py), so H(X_l) needs to describe that same
+            # tensor. `out` -- the module's own raw, pre-BatchNorm,
+            # pre-activation output -- is a different tensor with a
+            # different distribution. `inp[0]` is the actual argument the
+            # module's forward() received.
+            x = inp[0].detach()
             if self.entropy_mode == 'per_tensor':
-                flat = x.reshape(-1)
+                flat = x.reshape(-1).float()
                 if flat.numel() == 0:
                     return
-                lo = torch.quantile(flat.float(), 1 - self.clip_percentile / 100.0).item()
-                hi = torch.quantile(flat.float(), self.clip_percentile / 100.0).item()
+                lo = _safe_quantile_1d(flat, 1 - self.clip_percentile / 100.0).item()
+                hi = _safe_quantile_1d(flat, self.clip_percentile / 100.0).item()
                 if layer_idx not in self._running_min:
                     self._running_min[layer_idx] = lo
                     self._running_max[layer_idx] = hi
@@ -141,8 +212,8 @@ class ActivationEntropyCollector:
                 x_by_channel = x.transpose(0, cdim).reshape(num_channels, -1).float()
                 if x_by_channel.numel() == 0:
                     return
-                lo = torch.quantile(x_by_channel, 1 - self.clip_percentile / 100.0, dim=1)
-                hi = torch.quantile(x_by_channel, self.clip_percentile / 100.0, dim=1)
+                lo = _safe_quantile_rows(x_by_channel, 1 - self.clip_percentile / 100.0)
+                hi = _safe_quantile_rows(x_by_channel, self.clip_percentile / 100.0)
                 if layer_idx not in self._running_min:
                     self._running_min[layer_idx] = lo
                     self._running_max[layer_idx] = hi
@@ -154,7 +225,8 @@ class ActivationEntropyCollector:
     # ---- pass 2: accumulate histogram counts using the fixed range ----
     def _hist_hook(self, layer_idx):
         def hook(module, inp, out):
-            x = out.detach().float()
+            # See _range_hook above: inp[0], not out -- same bug fix.
+            x = inp[0].detach().float()
             if self.entropy_mode == 'per_tensor':
                 flat = x.reshape(-1)
                 lo = self._running_min[layer_idx]

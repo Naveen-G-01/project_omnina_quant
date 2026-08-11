@@ -104,7 +104,12 @@ def accuracy(output, target, topk=(1,)):
 
     res = []
     for k in topk:
-        correct_k = correct[:k].view(-1).float().sum(0)
+        # Bug fix: `correct` (built via pred.t() then .eq()) isn't
+        # guaranteed contiguous, and .view() can raise "view size is not
+        # compatible with input tensor's size and stride" on current
+        # PyTorch depending on the resulting layout. .reshape() handles
+        # both cases identically (falls back to a copy only if needed).
+        correct_k = correct[:k].reshape(-1).float().sum(0)
         res.append(correct_k.mul_(100.0 / batch_size))
     return res
 

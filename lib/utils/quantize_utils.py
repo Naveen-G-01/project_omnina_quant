@@ -75,11 +75,17 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 from torch.nn.modules.utils import _single, _pair, _triple
 
-from progress.bar import Bar
-from sklearn.cluster import KMeans
+# Bug fix: `progress` and `scikit-learn` used to be imported at module
+# scope, which meant QConv2d/QLinear/calibrate() -- the parts
+# entropy_quantize.py's entropy-driven pipeline actually uses -- couldn't
+# even be imported without both installed, even though only the k-means
+# weight-quantization path below (quantize_model/kmeans_update_model, not
+# called anywhere in Project Omnia's pipeline) needs them. Deferred to
+# inside the functions that use them instead.
 
 
 def k_means_cpu(weight, n_clusters, init='k-means++', max_iter=50):
+    from sklearn.cluster import KMeans
     # flatten the weight for computing k-means
     org_shape = weight.shape
     weight = weight.reshape(-1, 1)  # single feature
@@ -104,6 +110,7 @@ def reconstruct_weight_from_k_means_result(centroids, labels):
 
 def quantize_model(model, quantize_index, quantize_bits, max_iter=50, mode='cpu', quantize_bias=False,
                    centroids_init='k-means++', is_pruned=False, free_high_bit=False):
+    from progress.bar import Bar
     assert len(quantize_index) == len(quantize_bits), \
         'You should provide the same number of bit setting as layer list!'
     if free_high_bit:
@@ -571,6 +578,29 @@ class QLinear(QModule):
 
 
 def calibrate(model, loader):
+    """
+    Runs a single calibration forward pass with every QModule's
+    `_calibrate` flag set, so weight_range/activation_range get set from
+    real data (see QModule._quantize_weight / _quantize_activation).
+
+    Two bug fixes from code review, relative to the original HAQ version:
+
+      1. Device is auto-detected from the model's own parameters instead
+         of hardcoded to 'cuda:0' -- the old code crashed (or silently
+         calibrated against the wrong device) on any model that wasn't
+         explicitly placed on cuda:0, including plain CPU runs.
+      2. ALL batches from `loader` are concatenated into one forward pass,
+         instead of just `next(iter(loader))`'s first batch. With
+         entropy_quantize.py's calib_loader (batch_size=--calib_batch,
+         default 25, drawn from a --calib_size=100 stream), the original
+         code let only the *first* 25 images ever set S_l/Z_l -- the rest
+         were seen by the entropy pass but never touched calibration.
+         Every image in the calibration stream now contributes. This
+         scales with calib_size (a single bigger forward pass, no
+         gradients) -- fine for the "tiny calibration subset" this
+         project is designed around; if you push --calib_size very high,
+         be aware this now does one correspondingly larger forward pass.
+    """
     data_parallel_flag = False
     if hasattr(model, 'module'):
         data_parallel_flag = True
@@ -579,11 +609,13 @@ def calibrate(model, loader):
     for name, module in model.named_modules():
         if isinstance(module, QModule):
             module.set_calibrate(calibrate=True)
-    inputs, _ = next(iter(loader))
-    # use 1 gpu to calibrate
-    inputs = inputs.to('cuda:0', non_blocking=True)
+
+    device = next(model.parameters()).device
+    all_inputs = torch.cat([images for images, _ in loader], dim=0)
+    all_inputs = all_inputs.to(device, non_blocking=True)
     with torch.no_grad():
-        model(inputs)
+        model(all_inputs)
+
     for name, module in model.named_modules():
         if isinstance(module, QModule):
             module.set_calibrate(calibrate=False)

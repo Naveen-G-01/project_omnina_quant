@@ -9,6 +9,14 @@
 # branches. Both are needed to show mixed-precision assignment doesn't
 # cause catastrophic accuracy loss on standard classification tasks,
 # independent of the full ImageNet-1k results.
+#
+# Also adds get_calibration_loader() (bug fix from code review) -- see its
+# docstring below. entropy_quantize.py previously built its calibration
+# subset as `Subset(train_loader.dataset, list(range(calib_size)))`, which
+# for ImageFolder-backed datasets pulls entirely from whichever class
+# sorts first alphabetically (ImageNet-1k has ~1,300 images/class, so
+# range(100) never left the first class), using train-time-augmented
+# (RandomResizedCrop/RandomHorizontalFlip) images to boot.
 # ---------------------------------------------------------------------------
 
 import os
@@ -322,3 +330,91 @@ def get_split_train_dataset(dataset_name, batch_size, n_worker, val_size, train_
         raise NotImplementedError
 
     return train_loader, val_loader, n_class
+
+
+def _get_normalize_and_size(dataset_name, for_inception=False):
+    """
+    Project Omnia addendum: factors the per-dataset Normalize()/input-size
+    pair -- previously copy-pasted across every branch of get_dataset()
+    above -- into one place, so get_calibration_loader() below reuses
+    exactly the same normalization val_loader uses instead of risking it
+    drifting out of sync over time.
+    """
+    input_size = 299 if for_inception else 224
+    if dataset_name in ('imagenet', 'imagenet100', 'imagenet10', 'imagenet_mini'):
+        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                         std=[0.229, 0.224, 0.225])
+    elif dataset_name == 'cifar100':
+        normalize = transforms.Normalize(mean=[0.5071, 0.4865, 0.4409],
+                                         std=[0.2673, 0.2564, 0.2762])
+        input_size = 224
+    else:
+        raise NotImplementedError(
+            "_get_normalize_and_size does not know dataset_name=%r" % dataset_name)
+    return normalize, input_size
+
+
+def get_calibration_loader(dataset_name, data_root, calib_size, batch_size,
+                           n_worker=4, seed=234, for_inception=False):
+    """
+    Project Omnia addendum (bug fix from code review) -- builds the "tiny
+    calibration subset (100 sample images)" stream entropy_quantize.py
+    uses for both the entropy pass and quantize_utils.calibrate()'s
+    S_l/Z_l estimation.
+
+    Two things this fixes relative to the original
+    `Subset(train_loader.dataset, list(range(calib_size)))` approach:
+
+      1. Representativeness: for the imagenet*/imagenet_mini branches,
+         `train_loader.dataset` is a torchvision ImageFolder, which lists
+         samples grouped by class in alphabetical order. `range(100)` on
+         a dataset with ~1,300 images/class (ImageNet-1k) pulled entirely
+         from whichever class sorts first -- not a representative sample
+         of "typical" activations. This function instead draws
+         `calib_size` indices *uniformly at random* (seeded, for
+         reproducibility) from the entire training split.
+      2. Preprocessing: train_loader's dataset uses training-time
+         augmentation (RandomResizedCrop, RandomHorizontalFlip), so the
+         same calibration image would contribute different, randomly
+         perturbed pixels on every run. This function uses the same
+         deterministic Resize+CenterCrop pipeline as val_loader, so
+         calibration statistics are stable and reproducible for a given
+         seed.
+
+    Returns a DataLoader (shuffle=False -- the *selection* of indices is
+    already randomized, so loader order doesn't matter) of `calib_size`
+    images with batch_size=`batch_size`.
+    """
+    normalize, input_size = _get_normalize_and_size(dataset_name, for_inception)
+    eval_transform = transforms.Compose([
+        transforms.Resize(int(input_size / 0.875)),
+        transforms.CenterCrop(input_size),
+        transforms.ToTensor(),
+        normalize,
+    ])
+
+    if dataset_name in ('imagenet', 'imagenet100', 'imagenet10', 'imagenet_mini'):
+        traindir = os.path.join(data_root, 'train')
+        assert os.path.exists(traindir), traindir + ' not found'
+        full_dataset = datasets.ImageFolder(traindir, eval_transform)
+    elif dataset_name == 'cifar100':
+        full_dataset = datasets.CIFAR100(root=data_root, train=True, download=True,
+                                         transform=eval_transform)
+    else:
+        raise NotImplementedError(
+            "get_calibration_loader does not support dataset_name=%r; add a "
+            "branch here the same way get_dataset() has one." % dataset_name)
+
+    n_total = len(full_dataset)
+    if calib_size > n_total:
+        raise ValueError(
+            'calib_size=%d exceeds the %s training set size (%d)' %
+            (calib_size, dataset_name, n_total))
+
+    rng = np.random.RandomState(seed)
+    calib_indices = rng.choice(n_total, size=calib_size, replace=False).tolist()
+    calib_subset = torch.utils.data.Subset(full_dataset, calib_indices)
+
+    return torch.utils.data.DataLoader(
+        calib_subset, batch_size=batch_size, shuffle=False,
+        num_workers=n_worker, pin_memory=True)
