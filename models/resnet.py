@@ -1,26 +1,41 @@
 # models/resnet.py
 #
-# Project Omnia addendum 
+# Project Omnia addendum (experimental_checklist.md Section 1: "Select
+# Architectures" -- "choose more than two architecture families ... so
+# generalization claims aren't limited to a single model type").
 #
 # A from-scratch (not torchvision-derived) ResNet-18/50 that follows the
 # same `conv_layer` swap pattern as models/mobilenet.py and
 # models/mobilenetv2.py: pass conv_layer=QConv2d to get a quantizable
 # variant whose QConv2d/QLinear submodules expose the .w_bit/.a_bit
 # attributes that entropy_quantize.py's apply_strategy() writes to.
+#
+# A from-scratch definition (rather than monkey-patching
+# torchvision.models.resnet) is used because torchvision's Conv2d calls
+# are hardcoded and can't be swapped for QConv2d without editing
+# torchvision's own source; this also matches the existing repo
+# convention (see mobilenet.py/mobilenetv2.py) of shadowing
+# torchvision's model-registry names with a locally-defined,
+# quantization-aware equivalent -- see entropy_quantize.py's/
+# pretrain.py's `models.__dict__[name] = customized_models.__dict__[name]`
+# override loop.
+#
+# Unlike MobileNetV2's inverted residuals, standard ResNet blocks apply a
+# ReLU *after* the residual add (no "linear bottleneck"), so -- unlike
+# mobilenetv2.py -- half_wave=False is only needed on the very first stem
+# conv (which sees the raw, mean-subtracted image and can be negative);
+# every other conv's input has already passed through a ReLU somewhere
+# upstream and is safely half_wave=True (the default).
 
 import math
+
 import torch
 import torch.nn as nn
-from torch.hub import load_state_dict_from_url
 
 from lib.utils.quantize_utils import QConv2d, QLinear
 
 __all__ = ['ResNet', 'resnet18', 'resnet50', 'qresnet18', 'qresnet50']
 
-model_urls = {
-    'resnet18': 'https://download.pytorch.org/models/resnet18-f37072fd.pth',
-    'resnet50': 'https://download.pytorch.org/models/resnet50-0676ba61.pth',
-}
 
 def conv3x3(in_planes, out_planes, stride=1, conv_layer=nn.Conv2d, half_wave=True):
     if conv_layer == nn.Conv2d:
@@ -42,6 +57,9 @@ class BasicBlock(nn.Module):
 
     def __init__(self, inplanes, planes, stride=1, downsample=None, conv_layer=nn.Conv2d):
         super(BasicBlock, self).__init__()
+        # both convs' inputs have already passed through a ReLU upstream
+        # (either the stem's, or this block's own self.relu below applied
+        # to a *previous* iteration) -> half_wave=True (default) is safe.
         self.conv1 = conv3x3(inplanes, planes, stride, conv_layer=conv_layer)
         self.bn1 = nn.BatchNorm2d(planes)
         self.relu = nn.ReLU(inplace=True)
@@ -113,6 +131,7 @@ class ResNet(nn.Module):
         if conv_layer == nn.Conv2d:
             self.conv1 = conv_layer(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
         else:
+            # stem consumes the raw, normalized image -> can be negative
             self.conv1 = conv_layer(3, 64, kernel_size=7, stride=2, padding=3,
                                     bias=False, half_wave=False)
         self.bn1 = nn.BatchNorm2d(64)
@@ -182,28 +201,20 @@ class ResNet(nn.Module):
 def resnet18(pretrained=False, **kwargs):
     model = ResNet(BasicBlock, [2, 2, 2, 2], **kwargs)
     if pretrained:
-        state_dict = load_state_dict_from_url(model_urls['resnet18'], progress=True)
-        
-        # If kwargs changes num_classes, strip the fc layer from the loaded weights
-        if 'num_classes' in kwargs and kwargs['num_classes'] != 1000:
-            state_dict = {k: v for k, v in state_dict.items() if not k.startswith('fc.')}
-            model.load_state_dict(state_dict, strict=False)
-        else:
-            model.load_state_dict(state_dict)
+        raise NotImplementedError(
+            'No FP32 pretrained checkpoint is bundled with this repo -- train '
+            'one first with `pretrain.py --arch resnet18` (this is a from-'
+            'scratch ResNet definition, not torchvision.models.resnet18, so '
+            'torchvision ImageNet weights are not directly loadable).')
     return model
 
 
 def resnet50(pretrained=False, **kwargs):
     model = ResNet(Bottleneck, [3, 4, 6, 3], **kwargs)
     if pretrained:
-        state_dict = load_state_dict_from_url(model_urls['resnet50'], progress=True)
-        
-        # If kwargs changes num_classes, strip the fc layer from the loaded weights
-        if 'num_classes' in kwargs and kwargs['num_classes'] != 1000:
-            state_dict = {k: v for k, v in state_dict.items() if not k.startswith('fc.')}
-            model.load_state_dict(state_dict, strict=False)
-        else:
-            model.load_state_dict(state_dict)
+        raise NotImplementedError(
+            'No FP32 pretrained checkpoint is bundled with this repo -- train '
+            'one first with `pretrain.py --arch resnet50`.')
     return model
 
 

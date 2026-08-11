@@ -179,8 +179,15 @@ def mobilenetv2(pretrained=False, **kwargs):
 
 
 def qmobilenetv2(pretrained=False, num_classes=1000, **kwargs):
-    # model = MobileNetV2(conv_layer=QConv2d, **kwargs)
-    model = MobileNetV2(conv_layer=QConv2d, num_classes=1000, **kwargs)
+    # Bug fix: this used to hardcode num_classes=1000 here regardless of
+    # what was passed in, so entropy_quantize.py's
+    # `models.__dict__[args.arch](pretrained=False, num_classes=n_class)`
+    # silently built a 1000-way classifier even when n_class (from
+    # get_dataset(), e.g. cifar100 -> 100) was something else. Harmless on
+    # ImageNet (1000 happens to be correct) -- silently wrong everywhere
+    # else, including a shape mismatch against any correctly-sized FP32
+    # checkpoint at load_fp32_weights() time.
+    model = MobileNetV2(conv_layer=QConv2d, num_classes=num_classes, **kwargs)
     if pretrained:
         # Load pretrained model.
         path = 'pretrained/imagenet/mobilenetv2-150.pth.tar'
