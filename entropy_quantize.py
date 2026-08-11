@@ -35,7 +35,7 @@ import torchvision.models as models
 import models as customized_models
 
 from lib.utils.utils import Logger, AverageMeter, accuracy
-from lib.utils.data_utils import get_dataset
+from lib.utils.data_utils import get_dataset, get_calibration_loader
 from lib.utils.quantize_utils import QConv2d, QLinear, calibrate
 from lib.utils.entropy_utils import (
     run_calibration_and_get_entropy,
@@ -43,6 +43,7 @@ from lib.utils.entropy_utils import (
     estimate_compression,
     sweep_tau,
 )
+from lib.utils.model_registry import build_model_registry
 
 # try to hook into HAQ's hardware lookup-table simulator for real latency
 # numbers ("[Emulated FPGA Latency & Accuracy Checks]" in the pipeline
@@ -56,16 +57,9 @@ except Exception:
 
 
 # ----------------------------- model registry -----------------------------
-default_model_names = sorted(name for name in models.__dict__
-    if name.islower() and not name.startswith("__")
-    and callable(models.__dict__[name]))
-customized_models_names = sorted(name for name in customized_models.__dict__
-    if name.islower() and not name.startswith("__")
-    and callable(customized_models.__dict__[name]))
-for name in customized_models.__dict__:
-    if name.islower() and not name.startswith("__") and callable(customized_models.__dict__[name]):
-        models.__dict__[name] = customized_models.__dict__[name]
-model_names = default_model_names + customized_models_names
+# (was a copy-pasted monkey-patch loop in this file, pretrain.py, and
+# rl_quantise.py -- now a single shared helper, see lib/utils/model_registry.py)
+model_names, models = build_model_registry(customized_models)
 
 
 def get_args():
@@ -89,12 +83,14 @@ def get_args():
     p.add_argument('--num_bins', default=256, type=int,
                    help='histogram bin count B for H(X_l) estimation (brief target: 256)')
     p.add_argument('--entropy_mode', default='per_tensor', choices=['per_tensor', 'per_channel'],
-                   help='per_tensor (default): one activation histogram per layer. '
-                        'per_channel: one histogram per output channel, mean-aggregated '
-                        'to a per-layer H(X_l) for tau-thresholding. See the "Histogram '
-                        'parameters" note in lib/utils/entropy_utils.py for the tradeoffs; '
-                        'run both and diff omnia_report.json to empirically justify the '
-                        'choice per experimental_checklist.md Section 1.')
+                   help='per_tensor (default): one activation histogram per layer, '
+                        'computed over each layer\'s input (the tensor a_bit actually '
+                        'quantizes). per_channel: one histogram per input channel, '
+                        'mean-aggregated to a per-layer H(X_l) for tau-thresholding. '
+                        'See the "Histogram parameters" note in '
+                        'lib/utils/entropy_utils.py for the tradeoffs; run both and '
+                        'diff omnia_report.json to empirically justify the choice per '
+                        'experimental_checklist.md Section 1.')
     p.add_argument('--tau_min', default=None, type=float,
                    help='if unset, derived from observed entropy range')
     p.add_argument('--tau_max', default=None, type=float)
@@ -123,7 +119,7 @@ def build_quantizable_index(model):
     return idx
 
 
-def load_fp32_weights(model, ckpt_path):
+def load_fp32_weights(model, ckpt_path, min_load_frac=0.5):
     ckpt = torch.load(ckpt_path, map_location='cpu')
     state_dict = ckpt.get('state_dict', ckpt)
     state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
@@ -137,6 +133,20 @@ def load_fp32_weights(model, ckpt_path):
             skipped += 1
     model.load_state_dict(model_state)
     print(f'[load_fp32_weights] loaded {loaded} tensors, skipped {skipped} (shape/name mismatch)')
+    # Bug fix: previously nothing checked *how many* tensors actually
+    # loaded, so --resume pointed at a checkpoint for the wrong
+    # architecture would silently proceed with partially-or-entirely
+    # random weights -- every downstream accuracy number would then be
+    # meaningless with no error or warning. Pass min_load_frac=0 if a
+    # partial/transfer load is genuinely what you want.
+    total = loaded + skipped
+    if total == 0 or (loaded / total) < min_load_frac:
+        raise RuntimeError(
+            f'[load_fp32_weights] only {loaded}/{total} tensors matched between '
+            f'{ckpt_path!r} and the constructed --arch model -- this checkpoint '
+            f'almost certainly does not match. Refusing to continue with mostly-'
+            f'random weights. Pass min_load_frac=0 to load_fp32_weights() if this '
+            f'is intentional.')
     return model
 
 
@@ -173,12 +183,25 @@ def main():
         dataset_name=args.dataset, batch_size=args.eval_batch,
         n_worker=args.workers, data_root=args.dataset_root)
 
-    # calibration stream: first `calib_size` images from the train loader's
-    # underlying dataset, matching the brief's "Tiny calibration subset
-    # (100 sample images)" requirement -- NOT the full train set.
-    calib_dataset = torch.utils.data.Subset(train_loader.dataset, list(range(args.calib_size)))
-    calib_loader = torch.utils.data.DataLoader(
-        calib_dataset, batch_size=args.calib_batch, shuffle=False, num_workers=args.workers)
+    # calibration stream: `calib_size` images (brief target: 100), matching
+    # the brief's "Tiny calibration subset (100 sample images)" requirement
+    # -- NOT the full train set.
+    #
+    # Bug fix: this used to be `Subset(train_loader.dataset,
+    # list(range(calib_size)))`. For ImageFolder-backed datasets (imagenet/
+    # imagenet100/imagenet10/imagenet_mini), samples are listed grouped by
+    # class in alphabetical order, so range(100) pulled entirely from
+    # whichever class sorted first (ImageNet-1k has ~1,300 images/class) --
+    # not a representative calibration sample -- using train_loader's
+    # augmented (RandomResizedCrop/RandomHorizontalFlip) transform to boot.
+    # get_calibration_loader() draws `calib_size` indices uniformly at
+    # random across the whole training split (seeded by --seed, for
+    # reproducibility) with the same deterministic Resize+CenterCrop
+    # preprocessing val_loader uses. See its docstring in data_utils.py.
+    calib_loader = get_calibration_loader(
+        dataset_name=args.dataset, data_root=args.dataset_root,
+        calib_size=args.calib_size, batch_size=args.calib_batch,
+        n_worker=args.workers, seed=args.seed)
 
     # ---- 2. build model + load FP32 weights ------------------------------
     model = models.__dict__[args.arch](pretrained=False, num_classes=n_class)

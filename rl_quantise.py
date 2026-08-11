@@ -17,21 +17,20 @@ import torch
 import torch.backends.cudnn as cudnn
 import torchvision.models as models
 import models as customized_models
+from lib.utils.model_registry import build_model_registry
 
 # Models
-default_model_names = sorted(name for name in models.__dict__
-    if name.islower() and not name.startswith("__")
-    and callable(models.__dict__[name]))
-
-customized_models_names = sorted(name for name in customized_models.__dict__
-    if name.islower() and not name.startswith("__")
-    and callable(customized_models.__dict__[name]))
-
-for name in customized_models.__dict__:
-    if name.islower() and not name.startswith("__") and callable(customized_models.__dict__[name]):
-        models.__dict__[name] = customized_models.__dict__[name]
-
-model_names = default_model_names + customized_models_names
+# (was a copy-pasted monkey-patch loop, same as entropy_quantize.py/
+# pretrain.py used to have -- now a single shared helper, see
+# lib/utils/model_registry.py)
+#
+# NOTE: this script still cannot run standalone -- the imports below
+# (lib.env.quantize_env, lib.env.linear_quantize_env, lib.rl.ddpg) were
+# never part of the uploaded files, consistent with README.md's own
+# description of rl_quantise.py as HAQ's original RL search, kept for
+# reference/comparison and not used by entropy_quantize.py's pipeline.
+# This dedup is the only change made here.
+model_names, models = build_model_registry(customized_models)
 print('support models: ', model_names)
 
 

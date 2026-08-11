@@ -27,23 +27,18 @@ except:
 from lib.utils.utils import Logger, AverageMeter, accuracy
 from lib.utils.data_utils import get_dataset
 from progress.bar import Bar
-from lib.utils.quantize_utils import quantize_model, kmeans_update_model, QConv2d, QLinear, calibrate, dorefa, set_fix_weight
+from lib.utils.model_registry import build_model_registry
 
+# Bug fix: this used to also import quantize_model, kmeans_update_model,
+# QConv2d, QLinear, calibrate, dorefa, and set_fix_weight from
+# quantize_utils.py -- none of which this file (a plain FP32 training/
+# finetuning script) actually uses anywhere below. Dead imports removed.
 
 # Models
-default_model_names = sorted(name for name in models.__dict__
-    if name.islower() and not name.startswith("__")
-    and callable(models.__dict__[name]))
-
-customized_models_names = sorted(name for name in customized_models.__dict__
-    if name.islower() and not name.startswith("__")
-    and callable(customized_models.__dict__[name]))
-
-for name in customized_models.__dict__:
-    if name.islower() and not name.startswith("__") and callable(customized_models.__dict__[name]):
-        models.__dict__[name] = customized_models.__dict__[name]
-
-model_names = default_model_names + customized_models_names
+# (was a copy-pasted monkey-patch loop, same as entropy_quantize.py/
+# rl_quantise.py used to have -- now a single shared helper, see
+# lib/utils/model_registry.py)
+model_names, models = build_model_registry(customized_models)
 
 # Parse arguments
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
@@ -147,7 +142,9 @@ def train(train_loader, model, criterion, optimizer, epoch, use_cuda):
 
         if use_cuda:
             inputs, targets = inputs.cuda(), targets.cuda()
-        inputs, targets = torch.autograd.Variable(inputs), torch.autograd.Variable(targets)
+        # (Variable(inputs)/Variable(targets) used to be here -- vestigial
+        # since PyTorch 0.4 merged Variable into Tensor; plain Tensors
+        # already support autograd.)
 
         # compute output
         outputs = model(inputs)
@@ -216,7 +213,10 @@ def test(val_loader, model, criterion, epoch, use_cuda):
 
             if use_cuda:
                 inputs, targets = inputs.cuda(), targets.cuda()
-            inputs, targets = torch.autograd.Variable(inputs, volatile=True), torch.autograd.Variable(targets)
+            # (Variable(inputs, volatile=True) used to be here -- `volatile`
+            # was removed from PyTorch years ago; `with torch.no_grad():`,
+            # already wrapping this whole loop above, is the modern
+            # replacement and was already doing the real work.)
 
             # compute output
             outputs = model(inputs)
